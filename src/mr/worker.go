@@ -1,77 +1,140 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"bufio"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"strings"
+)
 
+// for sorting by key.
+type ByKey []KeyValue
 
-//
-// Map functions return a slice of KeyValue.
-//
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 type KeyValue struct {
 	Key   string
 	Value string
 }
 
-//
-// use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
-//
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
-//
 // main/mrworker.go calls this function.
-//
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+	for {
+		args := TaskArgs{}
+		reply := TaskReply{}
+		ok := call("Coordinator.CollectWork", &args, &reply)
+		if !ok {
+			continue
+		}
+		if reply.ReturnTask.Work == MapTask {
+			DoMapWork(mapf, reply.ReturnTask)
+			call("Coordinator.MapWorkDone",&args,&reply)
+		} else if reply.ReturnTask.Work == ReduceTask {
+			DoReduceWork(reducef, reply.ReturnTask)
+			call("Coordinator.CoordinatorWorkDone",&args,&reply)
+		}
+	}
 
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func sendheartbyte() {
+	panic("not implemented")
+}
 
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+func DoMapWork(mapf func(string, string) []KeyValue, task *Task) {
+	file, err := os.Open(task.mapfilename)
+	if err != nil {
+		panic(err)
+	}
+	content, err := io.ReadAll(file)
+	if err != nil {
+		panic(err)
+	}
+	KeyValueList := mapf(task.mapfilename, string(content))
+	oname := fmt.Sprintf("mr-%d-%d", task.Id, task.nReduce)
+	task.mapfilename = oname
+	// 写入文件
+	ofile, err := os.Create(oname)
+	if err != nil {
+		fmt.Println("Create file failed:", err)
+	}
+	defer ofile.Close()
+	for _, kv := range KeyValueList {
+		fmt.Fprintf(ofile, "%v %v\n", kv.Key, kv.Value)
 	}
 }
 
-//
-// send an RPC request to the coordinator, wait for the response.
-// usually returns true.
-// returns false if something goes wrong.
-//
+func DoReduceWork(reducef func(string, []string) string, task *Task) {
+	// 读取所有Y为nReduce的文件
+	var intermediate []KeyValue
+	for _, file := range task.reducefilename {
+		f, err := os.Open(file)
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Text()
+			parts := strings.Split(line, "\n") // 假设键值对用制表符分隔
+			if len(parts) != 2 {
+				fmt.Printf("Invalid line format: %s\n", line)
+				continue
+			}
+			key := parts[0]
+			value := parts[1]
+			intermediate = append(intermediate, KeyValue{Key: key, Value: value})
+		}
+
+		if err := scanner.Err(); err != nil {
+			panic(err)
+		}
+	}
+	// 对中间结果进行排序
+	sort.Sort(ByKey(intermediate))
+	// 生成当前 Reduce 任务的输出文件名
+	outputFileName := fmt.Sprintf("mr-out-%d", task.nReduce)
+	outputFile, err := os.Create(outputFileName)
+	if err != nil {
+		log.Printf("Failed to create output file %s: %v", outputFileName, err)
+		return
+	}
+	defer outputFile.Close()
+
+	// reduce操作
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := make([]string, j-i)
+		for k := i; k < j; k++ {
+			values[k-i] = intermediate[k].Value
+		}
+		output := reducef(intermediate[i].Key, values)
+		fmt.Fprintf(outputFile, "%v %v\n", intermediate[i].Key, output)
+		i = j
+	}
+
+	log.Printf("Reduce task %d completed, output file: %s", task.nReduce, outputFileName)
+}
+
 func call(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
