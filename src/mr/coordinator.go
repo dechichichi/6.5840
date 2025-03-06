@@ -20,8 +20,9 @@ type Coordinator struct {
 	//tmp-M-R
 	Tasks map[int]*Task
 	//测心跳
-	CheckBytes map[int]bool
-	Phase      int
+	LastHeartbeat map[int]time.Time
+	CheckBytes    map[int]bool
+	Phase         int
 }
 type Task struct {
 	//个体id
@@ -49,10 +50,13 @@ const (
 // 考虑bool或者time
 // 我们在map完全结束之后才考虑reduce
 func (c *Coordinator) CollectWork(args *TaskArgs, reply *TaskReply) error {
+	c.Mutex.Lock()
+	defer c.Mutex.Unlock()
 	if c.Phase == MapWoring {
 		for i := 0; i < c.MapNum; i++ {
 			if c.Tasks[i].Work == MapTask {
 				reply.ReturnTask = c.Tasks[i]
+				args.MapId = i
 				return nil
 			}
 		}
@@ -62,6 +66,7 @@ func (c *Coordinator) CollectWork(args *TaskArgs, reply *TaskReply) error {
 		for i := c.MapNum; i < c.MapNum+c.ReduceNum; i++ {
 			if c.Tasks[i].Work == ReduceTask {
 				reply.ReturnTask = c.Tasks[i]
+				args.ReduceId = i
 				return nil
 			}
 		}
@@ -71,30 +76,48 @@ func (c *Coordinator) CollectWork(args *TaskArgs, reply *TaskReply) error {
 }
 
 func (c *Coordinator) MapWorkDone(args *TaskArgs, reply *TaskReply) {
+	c.Mutex.Lock()
+	defer c.Mutex.Unlock()
 	c.Tasks[args.ReduceId].reducefilename = append(c.Tasks[args.ReduceId].reducefilename, c.Tasks[args.MapId].mapfilename)
 	c.Tasks[args.MapId].Work = Done
 }
 
 func (c *Coordinator) ReduceWorkDone(args *TaskArgs, reply *TaskReply) {
+	c.Mutex.Lock()
+	defer c.Mutex.Unlock()
 	c.Tasks[args.ReduceId].Work = Done
 }
 
-func (c *Coordinator) ListenHeartBeat() {
-	time.Sleep(10000)
-	for i := 0; i < c.MapNum+c.ReduceNum; i++ {
-		if c.Tasks[i].Work == Break {
-			c.CheckBytes[i] = false
-		}
+// Worker定期调用HeartBeat
+func (c *Coordinator) HeartBeat(args *TaskArgs, reply *TaskReply) error {
+	c.Mutex.Lock()
+	defer c.Mutex.Unlock()
+	if args.MapId != -1 {
+		c.LastHeartbeat[args.MapId] = time.Now()
+	} else {
+		c.LastHeartbeat[args.ReduceId] = time.Now()
 	}
-	for i := 0; i < c.MapNum; i++ {
-		if !c.CheckBytes[i] {
-			c.Tasks[i].Work = MapTask
+	return nil
+}
+
+// 定期检查超时任务
+func (c *Coordinator) checkTimeouts() {
+	for {
+		time.Sleep(10 * time.Second)
+		c.Mutex.Lock()
+		now := time.Now()
+		for id, task := range c.Tasks {
+			if task.Work == MapTask || task.Work == ReduceTask {
+				if now.Sub(c.LastHeartbeat[id]) > 10*time.Second {
+					if task.Work == MapTask {
+						task.Work = MapTask
+					} else if task.Work == ReduceTask {
+						task.Work = ReduceTask
+					}
+				}
+			}
 		}
-	}
-	for i := c.MapNum; i < c.MapNum+c.ReduceNum; i++ {
-		if !c.CheckBytes[i] {
-			c.Tasks[i].Work = ReduceTask
-		}
+		c.Mutex.Unlock()
 	}
 }
 
@@ -132,7 +155,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 	for i := len(files); i < len(files)+nReduce; i++ {
 		task := Task{
-			nReduce: i,
+			Id:      i,
+			nReduce: i - len(files),
 			Work:    ReduceTask,
 		}
 		tasks[i] = &task
@@ -145,7 +169,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 	c.Mutex.Lock()
 	defer c.Mutex.Unlock()
-	go c.ListenHeartBeat()
+	go c.checkTimeouts()
 	c.server()
 	return &c
 }

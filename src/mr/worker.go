@@ -10,6 +10,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 )
 
 // for sorting by key.
@@ -41,19 +42,22 @@ func Worker(mapf func(string, string) []KeyValue,
 		if !ok {
 			continue
 		}
+		go func() {
+			ticker := time.NewTicker(5 * time.Second) // 设置定时器，每5秒触发一次
+			tr := call("Coordinator.HeartBeat", &args, &reply)
+			if !tr {
+				ticker.Stop()
+			}
+		}()
 		if reply.ReturnTask.Work == MapTask {
 			DoMapWork(mapf, reply.ReturnTask)
-			call("Coordinator.MapWorkDone",&args,&reply)
+			call("Coordinator.MapWorkDone", &args, &reply)
 		} else if reply.ReturnTask.Work == ReduceTask {
 			DoReduceWork(reducef, reply.ReturnTask)
-			call("Coordinator.CoordinatorWorkDone",&args,&reply)
+			call("Coordinator.CoordinatorWorkDone", &args, &reply)
 		}
 	}
 
-}
-
-func sendheartbyte() {
-	panic("not implemented")
 }
 
 func DoMapWork(mapf func(string, string) []KeyValue, task *Task) {
